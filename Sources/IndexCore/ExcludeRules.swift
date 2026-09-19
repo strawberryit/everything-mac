@@ -1,6 +1,15 @@
 public struct ExcludeRules: Sendable, Codable, Equatable {
     public var names: Set<String>
     public var pathPrefixes: [String]
+    // The boot volume is structurally the index root ("/"), so it cannot be disabled
+    // by adding "/" to pathPrefixes: that would also hide every mounted volume below
+    // /Volumes. Scanner filtering treats this flag specially, retaining /Volumes as a
+    // structural branch while skipping the rest of the boot filesystem.
+    public var excludeBootVolume: Bool
+    // Network volumes are excluded by default at runtime. These explicit opt-ins are
+    // persisted separately from path exclusions so enabling an SMB/NFS mount is an
+    // intentional operation and other network shares remain safely skipped.
+    public var includedNetworkMounts: [String]
     public var excludeHidden: Bool
     // When on, regenerable developer build/dependency directories are skipped on top
     // of the user's own `names`. Unambiguous names (see `devFolderNames`) are skipped
@@ -23,11 +32,14 @@ public struct ExcludeRules: Sendable, Codable, Equatable {
     public var excludeFilePatterns: [String]
 
     public init(names: Set<String> = [], pathPrefixes: [String] = [],
+                excludeBootVolume: Bool = false, includedNetworkMounts: [String] = [],
                 excludeHidden: Bool = false, excludeDevFolders: Bool = true,
                 excludeVCSFolders: Bool = true, excludeTrash: Bool = true,
                 excludeFilePatterns: [String] = []) {
         self.names = names
         self.pathPrefixes = pathPrefixes
+        self.excludeBootVolume = excludeBootVolume
+        self.includedNetworkMounts = includedNetworkMounts
         self.excludeHidden = excludeHidden
         self.excludeDevFolders = excludeDevFolders
         self.excludeVCSFolders = excludeVCSFolders
@@ -41,12 +53,14 @@ public struct ExcludeRules: Sendable, Codable, Equatable {
     // defaults). The three original fields are still hard-decoded — identical to the
     // synthesized conformance this replaces, so no pre-existing blob decodes worse.
     private enum CodingKeys: String, CodingKey {
-        case names, pathPrefixes, excludeHidden, excludeDevFolders, excludeVCSFolders, excludeTrash, excludeFilePatterns
+        case names, pathPrefixes, excludeBootVolume, includedNetworkMounts, excludeHidden, excludeDevFolders, excludeVCSFolders, excludeTrash, excludeFilePatterns
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         names = try c.decode(Set<String>.self, forKey: .names)
         pathPrefixes = try c.decode([String].self, forKey: .pathPrefixes)
+        excludeBootVolume = try c.decodeIfPresent(Bool.self, forKey: .excludeBootVolume) ?? false
+        includedNetworkMounts = try c.decodeIfPresent([String].self, forKey: .includedNetworkMounts) ?? []
         excludeHidden = try c.decode(Bool.self, forKey: .excludeHidden)
         excludeDevFolders = try c.decodeIfPresent(Bool.self, forKey: .excludeDevFolders) ?? true
         excludeVCSFolders = try c.decodeIfPresent(Bool.self, forKey: .excludeVCSFolders) ?? true
@@ -114,6 +128,9 @@ public struct ExcludeRules: Sendable, Codable, Equatable {
     /// it for every child, so the generic marker-scoped names are only skipped there.
     public func shouldExclude(name: String, path: String, isHidden: Bool,
                               inProjectDir: Bool = false) -> Bool {
+        // Keep /Volumes itself and its descendants reachable when the boot volume is
+        // disabled. Per-volume rules below still decide which mounted volumes enter.
+        if excludeBootVolume && path != "/Volumes" && !path.hasPrefix("/Volumes/") { return true }
         if excludeHidden && isHidden { return true }
         if names.contains(name) { return true }
         if excludeVCSFolders && Self.vcsFolderNames.contains(name) { return true }
@@ -122,7 +139,13 @@ public struct ExcludeRules: Sendable, Codable, Equatable {
             if Self.devFolderNames.contains(name) { return true }
             if inProjectDir && Self.markerScopedDevFolderNames.contains(name) { return true }
         }
-        for prefix in pathPrefixes where path.hasPrefix(prefix) { return true }
+        // Match path-component boundaries. A rule for /Volumes/work must not also
+        // exclude a different volume named /Volumes/work-archive.
+        for rawPrefix in pathPrefixes {
+            let prefix = rawPrefix.count > 1 && rawPrefix.hasSuffix("/")
+                ? String(rawPrefix.dropLast()) : rawPrefix
+            if path == prefix || path.hasPrefix(prefix + "/") { return true }
+        }
         return false
     }
 
@@ -151,11 +174,13 @@ public struct ExcludeRules: Sendable, Codable, Equatable {
         var hash: UInt64 = 1469598103934665603 // FNV-1a offset basis
         func mix(_ s: String) { for b in s.utf8 { hash = (hash ^ UInt64(b)) &* 1099511628211 } }
         mix(excludeHidden ? "H1" : "H0")
+        mix(excludeBootVolume ? "B1" : "B0")
         mix(excludeDevFolders ? "D1" : "D0")
         mix(excludeVCSFolders ? "V1" : "V0")
         mix(excludeTrash ? "T1" : "T0")
         mix("N"); for n in names.sorted() { mix(n); mix("\u{1}") }
         mix("P"); for p in pathPrefixes { mix(p); mix("\u{1}") }
+        mix("M"); for p in includedNetworkMounts.sorted() { mix(p); mix("\u{1}") }
         mix("F"); for p in excludeFilePatterns { mix(p); mix("\u{1}") }
         return hash
     }

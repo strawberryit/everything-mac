@@ -4,6 +4,12 @@ All notable changes to EverythingMac are recorded here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (`MAJOR.MINOR.PATCH`).
 
+## Unreleased
+
+### Added
+- Network SMB/NFS volumes can now be explicitly enabled in Settings ▸ Volumes. Selected shares are watched for filesystem events and reconciled every 30 seconds to catch server-side changes.
+- The boot macOS volume can now be disabled while selected external and network volumes remain indexed.
+
 ## [0.3.0] - 2026-06-24
 
 ### Added

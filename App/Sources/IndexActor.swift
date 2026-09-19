@@ -102,8 +102,16 @@ actor IndexActor {
         // Also skip network (non-local) mounts. Crawling an SMB/NFS share does one
         // network round-trip per lstat and an smbfs readdir blocks in uninterruptible
         // I/O — a single mounted share with millions of files hangs the whole scan.
-        effective.pathPrefixes += firmlinkBackDoors + Self.nonLocalMountPaths()
+        let optedIn = Set(rules.includedNetworkMounts.map(Self.normalizedMountPath))
+        let excludedNetworkMounts = Self.nonLocalMountPaths().filter {
+            !optedIn.contains(Self.normalizedMountPath($0))
+        }
+        effective.pathPrefixes += firmlinkBackDoors + excludedNetworkMounts
         return effective
+    }
+
+    private static func normalizedMountPath(_ path: String) -> String {
+        path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
     }
 
     // Mount points of non-local (network) filesystems — SMB/NFS/AFP/WebDAV shares.
@@ -139,6 +147,9 @@ actor IndexActor {
         store = newStore
         cachedQueryKey = nil
         onProgress?(store.count)
+        // Volume selections change the required FSEvents roots. Rebuilds triggered
+        // after Settings is applied must replace the old stream with the new roots.
+        if monitor != nil { restartMonitor() }
     }
 
     // Launch path: load the cache if present (FSEvents replays any changes made
@@ -187,6 +198,13 @@ actor IndexActor {
         monitor = m
     }
 
+    private func restartMonitor() {
+        monitor?.stop()
+        monitor = nil
+        lastEventID = FSEventsGetCurrentEventId()
+        startMonitor()
+    }
+
     // An FSEvents stream rooted at "/" only covers the boot volume's hierarchy
     // (System + firmlinked Data). Other volumes mount under /Volumes on separate
     // devices and need their own watch roots, or live updates never fire for files
@@ -199,14 +217,22 @@ actor IndexActor {
         // rescans every few minutes, which is why new files in the home folder took
         // minutes to appear). Watch the Data volume directly so home-folder changes are
         // instant; enqueueChanges maps the /System/Volumes/Data prefix back to canonical.
-        var paths = ["/", "/System/Volumes/Data"]
+        // Even with the boot volume disabled, retain a shallow /Volumes watch so
+        // selected disks appearing or disappearing are reflected in the index.
+        var paths = rules.excludeBootVolume ? ["/Volumes"] : ["/", "/System/Volumes/Data"]
         // Network shares are skipped (checked BEFORE lstat — stat'ing a network mount
         // point itself can block), matching the scan, which doesn't index them.
-        let networkMounts = Set(Self.nonLocalMountPaths())
+        let networkMounts = Set(Self.nonLocalMountPaths().map(Self.normalizedMountPath))
+        let optedIn = Set(rules.includedNetworkMounts.map(Self.normalizedMountPath))
         if let vols = try? FileManager.default.contentsOfDirectory(atPath: "/Volumes") {
             for v in vols.sorted() {
                 let p = "/Volumes/" + v
-                if networkMounts.contains(p) { continue }
+                let normalized = Self.normalizedMountPath(p)
+                if networkMounts.contains(normalized) && !optedIn.contains(normalized) { continue }
+                if rules.pathPrefixes.contains(where: { prefix in
+                    let normalizedPrefix = Self.normalizedMountPath(prefix)
+                    return normalized == normalizedPrefix || normalized.hasPrefix(normalizedPrefix + "/")
+                }) { continue }
                 var st = stat()
                 if lstat(p, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR { paths.append(p) }
             }
@@ -229,6 +255,10 @@ actor IndexActor {
     private var draining = false
 
     func enqueueChanges(_ changes: [LiveMonitor.FSChange]) {
+        // Mount topology can change after launch. Refresh automatic network
+        // exclusions before reconciling /Volumes so a newly mounted, non-opted-in
+        // share is not accidentally indexed by the live path.
+        liveRules = effectiveRules()
         for c in changes {
             let p = LiveMonitor.canonicalEventPath(c.path)
             pendingDirs.insert(p)
@@ -314,6 +344,39 @@ actor IndexActor {
         for dir in targets {
             if LiveMonitor.reconcile(directory: dir, in: &store, rules: liveRules, volID: 1,
                                      newlyIndexedDirs: &newlyIndexed) { changed = true }
+        }
+        guard changed else { return }
+        cachedQueryKey = nil
+        onLiveChange?()
+    }
+
+    // Changes made on the server side of an SMB/NFS mount are not guaranteed to
+    // produce local FSEvents. Periodically walk directory metadata for only the
+    // explicitly opted-in network volumes. reconcile's nanosecond mtime gate keeps
+    // unchanged directories to one stat, and yielding between small batches keeps
+    // searches from waiting behind the entire sweep.
+    func sweepNetworkVolumes() async {
+        let mounted = Set(Self.nonLocalMountPaths().map(Self.normalizedMountPath))
+        let roots = rules.includedNetworkMounts
+            .map(Self.normalizedMountPath)
+            .filter { mounted.contains($0) }
+        guard !roots.isEmpty else { return }
+
+        liveRules = effectiveRules()
+        var newlyIndexed = Set<String>()
+        var changed = false
+        var processed = 0
+        for root in roots {
+            guard store.idForDirPath(root) != nil else { continue }
+            var stack = [root]
+            while let dir = stack.popLast() {
+                if LiveMonitor.reconcileLevel(directory: dir, in: &store, rules: liveRules,
+                                              volID: 1, descend: true,
+                                              newlyIndexedDirs: &newlyIndexed,
+                                              pushChildDirsTo: &stack) { changed = true }
+                processed += 1
+                if processed % 64 == 0 { await Task.yield() }
+            }
         }
         guard changed else { return }
         cachedQueryKey = nil

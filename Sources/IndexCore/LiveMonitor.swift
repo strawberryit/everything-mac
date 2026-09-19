@@ -51,6 +51,10 @@ public final class LiveMonitor: @unchecked Sendable {
         let existing = store.childIDs(of: dirID)
 
         guard let dir = opendir(directory) else {
+            // An existing but temporarily unreadable directory (notably a stalled
+            // network mount) is not evidence that all of its children were deleted.
+            // Keep the cached subtree and try again on a later event/sweep.
+            if haveStat { return false }
             // The directory itself is gone — tombstone whatever children remain.
             var changed = false
             for id in existing { markSubtreeDeleted(id, in: &store); changed = true }

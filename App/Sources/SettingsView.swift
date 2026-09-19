@@ -8,6 +8,8 @@ import IndexCore
     @Published var namesText = ""
     @Published var filePatternsText = ""
     @Published var pathPrefixes: [String] = []
+    @Published var excludeBootVolume = false
+    @Published var includedNetworkMounts: [String] = []
     @Published var excludeHidden = false
     @Published var excludeDevFolders = true
     @Published var excludeVCSFolders = true
@@ -17,6 +19,8 @@ import IndexCore
         namesText = rules.names.sorted().joined(separator: "\n")
         filePatternsText = rules.excludeFilePatterns.joined(separator: "\n")
         pathPrefixes = rules.pathPrefixes
+        excludeBootVolume = rules.excludeBootVolume
+        includedNetworkMounts = rules.includedNetworkMounts
         excludeHidden = rules.excludeHidden
         excludeDevFolders = rules.excludeDevFolders
         excludeVCSFolders = rules.excludeVCSFolders
@@ -31,6 +35,8 @@ import IndexCore
         }
         return ExcludeRules(names: Set(lines(namesText)),
                             pathPrefixes: pathPrefixes,
+                            excludeBootVolume: excludeBootVolume,
+                            includedNetworkMounts: includedNetworkMounts,
                             excludeHidden: excludeHidden,
                             excludeDevFolders: excludeDevFolders,
                             excludeVCSFolders: excludeVCSFolders,

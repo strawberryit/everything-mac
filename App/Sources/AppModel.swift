@@ -34,6 +34,7 @@ final class AppModel: ObservableObject {
     private var liveTask: Task<Void, Never>?
     private var flushTimer: Task<Void, Never>?
     private var cloudSweepTimer: Task<Void, Never>?
+    private var networkSweepTimer: Task<Void, Never>?
     private var searchSeq = 0
 
     func bootstrap() {
@@ -53,6 +54,7 @@ final class AppModel: ObservableObject {
             await runSearch()
             startFlushTimer()
             startCloudSweep()
+            startNetworkSweep()
         }
     }
 
@@ -64,6 +66,19 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000) // 2s
                 if Task.isCancelled { return }
                 await index.sweepUserFolders()
+            }
+        }
+    }
+
+    // Server-side network-share changes may not emit FSEvents on this Mac. A modest
+    // fallback interval keeps opted-in SMB/NFS indexes current without polling shares
+    // the user did not explicitly enable.
+    private func startNetworkSweep() {
+        networkSweepTimer = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30s
+                if Task.isCancelled { return }
+                await index.sweepNetworkVolumes()
             }
         }
     }
