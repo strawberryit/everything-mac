@@ -12,6 +12,11 @@ App/EverythingMac.app
 # Tests (not needed to build or run the app; Package.swift wires them in only
 # when the Tests directory is present)
 Tests/
+!Tests/
+Tests/*
+!Tests/IndexCoreTests/
+Tests/IndexCoreTests/*
+!Tests/IndexCoreTests/LiveMonitorLifetimeTests.swift
 
 # macOS, logs, crash dumps
 .DS_Store

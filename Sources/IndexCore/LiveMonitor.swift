@@ -16,9 +16,28 @@ public final class LiveMonitor: @unchecked Sendable {
 
     private var stream: FSEventStreamRef?
     private let onChanged: ([FSChange]) -> Void
+    private let eventQueue = DispatchQueue(label: "fsevents")
+    private let eventQueueKey = DispatchSpecificKey<Bool>()
+
+    // The stream owns this context, not the monitor that owns the stream.
+    private final class CallbackContext {
+        let onChanged: ([FSChange]) -> Void
+        init(_ onChanged: @escaping ([FSChange]) -> Void) { self.onChanged = onChanged }
+    }
 
     public init(onChanged: @escaping ([FSChange]) -> Void) {
         self.onChanged = onChanged
+        eventQueue.setSpecific(key: eventQueueKey, value: true)
+    }
+
+    deinit { stop() }
+
+    private func onEventQueue(_ body: () -> Void) {
+        if DispatchQueue.getSpecific(key: eventQueueKey) == true {
+            body()
+        } else {
+            eventQueue.sync(execute: body)
+        }
     }
 
     // Re-scan one directory level and apply create/delete diffs against the store.
@@ -179,10 +198,24 @@ public final class LiveMonitor: @unchecked Sendable {
 
     public func start(paths: [String],
                       sinceWhen: FSEventStreamEventId = FSEventStreamEventId(kFSEventStreamEventIdSinceNow)) {
-        let info = Unmanaged.passUnretained(self).toOpaque()
-        var ctx = FSEventStreamContext(version: 0, info: info, retain: nil, release: nil, copyDescription: nil)
+        onEventQueue { startOnEventQueue(paths: paths, sinceWhen: sinceWhen) }
+    }
+
+    private func startOnEventQueue(paths: [String], sinceWhen: FSEventStreamEventId) {
+        stop()
+        let context = CallbackContext(onChanged)
+        let info = Unmanaged.passUnretained(context).toOpaque()
+        var ctx = FSEventStreamContext(version: 0, info: info, retain: { info in
+            guard let info else { return nil }
+            _ = Unmanaged<CallbackContext>.fromOpaque(info).retain()
+            return info
+        }, release: { info in
+            guard let info else { return }
+            Unmanaged<CallbackContext>.fromOpaque(info).release()
+        }, copyDescription: nil)
         let cb: FSEventStreamCallback = { _, info, count, paths, flags, _ in
-            let mon = Unmanaged<LiveMonitor>.fromOpaque(info!).takeUnretainedValue()
+            guard let info else { return }
+            let context = Unmanaged<CallbackContext>.fromOpaque(info).takeUnretainedValue()
             // Valid only because kFSEventStreamCreateFlagUseCFTypes is set below:
             // with that flag eventPaths is a CFArray<CFString>. Without it, paths
             // is a raw char** and this cast reads string bytes as a pointer →
@@ -195,7 +228,8 @@ public final class LiveMonitor: @unchecked Sendable {
                 guard let p = cfArray[i] as? String else { continue }
                 changes.append(FSChange(path: p, mustScanSubtree: (flags[i] & mustScan) != 0))
             }
-            mon.onChanged(changes)
+            // Keep the context alive even if the handler stops its own stream.
+            withExtendedLifetime(context) { context.onChanged(changes) }
         }
         // Directory-level events (NOT FileEvents). FSEvents coalesces and reports the
         // DIRECTORY in which something changed rather than emitting one path per
@@ -205,14 +239,22 @@ public final class LiveMonitor: @unchecked Sendable {
         // paths it couldn't act on.
         let flags = UInt32(kFSEventStreamCreateFlagNoDefer
                            | kFSEventStreamCreateFlagUseCFTypes)
-        stream = FSEventStreamCreate(nil, cb, &ctx, paths as CFArray, sinceWhen, 0.3, flags)
+        stream = withExtendedLifetime(context) {
+            FSEventStreamCreate(nil, cb, &ctx, paths as CFArray, sinceWhen, 0.3, flags)
+        }
         if let s = stream {
-            FSEventStreamSetDispatchQueue(s, DispatchQueue(label: "fsevents"))
-            FSEventStreamStart(s)
+            FSEventStreamSetDispatchQueue(s, eventQueue)
+            if !FSEventStreamStart(s) { stop() }
         }
     }
 
     public func stop() {
-        if let s = stream { FSEventStreamStop(s); FSEventStreamInvalidate(s); FSEventStreamRelease(s); stream = nil }
+        onEventQueue {
+            guard let s = stream else { return }
+            stream = nil
+            FSEventStreamStop(s)
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+        }
     }
 }
