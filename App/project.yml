@@ -35,5 +35,7 @@ targets:
         # + team + cert), so Full Disk Access persists across rebuilds. Empty
         # entitlements + non-sandboxed → no provisioning profile needed locally.
         CODE_SIGN_STYLE: Manual
-        CODE_SIGN_IDENTITY: "Apple Development: ALEJANDRO SLOAN (Q4Q986239Z)"
-        DEVELOPMENT_TEAM: KP9ZZ6LGDK
+        #CODE_SIGN_IDENTITY: "Apple Development: ALEJANDRO SLOAN (Q4Q986239Z)"
+        #DEVELOPMENT_TEAM: KP9ZZ6LGDK
+        CODE_SIGN_IDENTITY: "Apple Development: strawberryit@daum.net (7L32QRSU3R)"
+        DEVELOPMENT_TEAM: H62NDMYMX9
