@@ -6,7 +6,8 @@ public struct QueryEngine: Sendable {
     // Pre-classified term: ASCII bytes (fast path) or String fallback.
     private enum TermMatcher {
         case ascii([UInt8])   // lowercased ASCII pattern bytes
-        case string(String)   // original term, for non-ASCII or case-sensitive fallback
+        case string(String)   // original term, for case-sensitive ASCII fallback
+        case unicode(String)  // non-ASCII pattern; cannot match an ASCII-only name
     }
 
     // Returns matching record ids in ascending id order. All terms must match (AND).
@@ -14,9 +15,20 @@ public struct QueryEngine: Sendable {
     // a cheap refinement pass over the already-narrowed result set, so the inner scan
     // loops stay exactly as fast as before and pay nothing when the option is off.
     public func search(_ query: Query, in store: FileStore) -> [UInt32] {
-        let ids = rawSearch(query, in: store)
+        search(query, in: store, isCancelled: { false }) ?? []
+    }
+
+    public func search(_ query: Query, in store: FileStore,
+                       isCancelled: @escaping @Sendable () -> Bool) -> [UInt32]? {
+        guard !isCancelled(), let ids = rawSearch(query, in: store, isCancelled: isCancelled) else { return nil }
         guard query.wholeWord else { return ids }
-        return ids.filter { wholeWordMatch(query, id: $0, in: store) }
+        var matched: [UInt32] = []
+        matched.reserveCapacity(ids.count)
+        for (index, id) in ids.enumerated() {
+            if index & 1023 == 0 && isCancelled() { return nil }
+            if wholeWordMatch(query, id: id, in: store) { matched.append(id) }
+        }
+        return isCancelled() ? nil : matched
     }
 
     // Every plain (non-wildcard) term must occur as a whole word in the candidate's
@@ -33,7 +45,8 @@ public struct QueryEngine: Sendable {
     // For large stores the scan is split across cores — a per-keystroke linear scan
     // of millions of records is the floor for substring search, so parallelizing it
     // is what keeps typing instant.
-    private func rawSearch(_ query: Query, in store: FileStore) -> [UInt32] {
+    private func rawSearch(_ query: Query, in store: FileStore,
+                           isCancelled: @escaping @Sendable () -> Bool) -> [UInt32]? {
         let terms = query.terms
         let n = store.count
         // Empty query = every record. With no tombstones the id range IS the answer
@@ -41,33 +54,83 @@ public struct QueryEngine: Sendable {
         // ids — faster than the chunked scan here, whose per-chunk arrays + flatMap
         // merge cost more than the scan for an all-match result.
         if terms.isEmpty {
-            if !store.hasDeletions { return Array(0..<UInt32(n)) }
+            if !store.hasDeletions {
+                let ids = Array(0..<UInt32(n))
+                return isCancelled() ? nil : ids
+            }
             var out = [UInt32](); out.reserveCapacity(n)
             var id: UInt32 = 0
             let upper = UInt32(n)
-            while id < upper { if store.isLive(id) { out.append(id) }; id &+= 1 }
-            return out
+            while id < upper {
+                if id & 1023 == 0 && isCancelled() { return nil }
+                if store.isLive(id) { out.append(id) }
+                id &+= 1
+            }
+            return isCancelled() ? nil : out
         }
 
         let matchers: [TermMatcher] = terms.map { term in
             if query.caseInsensitive, let bytes = Glob.asciiLowerBytes(term) { return .ascii(bytes) }
+            if !term.utf8.allSatisfy({ $0 < 0x80 }) {
+                let folded = query.caseInsensitive ? term.lowercased().precomposedStringWithCanonicalMapping : term
+                if !folded.unicodeScalars.allSatisfy({ $0.value < 0x80 }) { return .unicode(term) }
+            }
             return .string(term)
         }
         let ci = query.caseInsensitive
         let matchPath = query.matchPath
-        let hasNonASCII = matchers.contains { if case .string = $0 { return true }; return false }
+        let hasNonASCII = matchers.contains {
+            switch $0 { case .ascii: return false; case .string, .unicode: return true }
+        }
+        let hasUnicodeTerm = matchers.contains { if case .unicode = $0 { return true }; return false }
+        if !matchPath && hasUnicodeTerm {
+            let ids = store.nonASCIINameIDs
+            let masks = store.nonASCIIUnicodeMasks
+            let requiredMask = matchers.reduce(UInt64(0)) { mask, matcher in
+                if case .unicode(let term) = matcher { return mask | FileStore.unicodeMask(term) }
+                return mask
+            }
+            // Most Unicode queries leave very few candidates after the mask check.
+            // Scanning those serially avoids waking every CPU core for each keystroke.
+            var candidateCount = 0
+            for index in masks.indices {
+                if index & 1023 == 0 && isCancelled() { return nil }
+                if masks[index] & requiredMask == requiredMask { candidateCount += 1 }
+            }
+            if candidateCount < 20_000 {
+                let found = scanIDs(ids[...], masks: masks[...], requiredMask: requiredMask,
+                                    matchers: matchers, ci: ci, isCancelled: isCancelled, in: store)
+                return isCancelled() ? nil : found
+            }
+            let chunks = min(2, ProcessInfo.processInfo.activeProcessorCount)
+            let span = (ids.count + chunks - 1) / chunks
+            var parts = [[UInt32]](repeating: [], count: chunks)
+            parts.withUnsafeMutableBufferPointer { buf in
+                DispatchQueue.concurrentPerform(iterations: chunks) { c in
+                    let lo = c * span
+                    let hi = min(ids.count, lo + span)
+                    guard lo < hi else { return }
+                    buf[c] = self.scanIDs(ids[lo..<hi], masks: masks[lo..<hi],
+                                          requiredMask: requiredMask, matchers: matchers,
+                                          ci: ci, isCancelled: isCancelled, in: store)
+                }
+            }
+            return isCancelled() ? nil : parts.flatMap { $0 }
+        }
 
         // Serial below this threshold — thread fan-out isn't worth it for small stores.
         if n < 100_000 {
-            return scanRange(0, UInt32(n), matchers: matchers, matchPath: matchPath,
-                             hasNonASCII: hasNonASCII, ci: ci, in: store)
+            let found = scanRange(0, UInt32(n), matchers: matchers, matchPath: matchPath,
+                                  hasNonASCII: hasNonASCII, ci: ci, isCancelled: isCancelled, in: store)
+            return isCancelled() ? nil : found
         }
 
         // Parallel: each chunk scans a contiguous id range with the same inlined
         // loop; results are concatenated in chunk order so output stays id-ascending.
         // `store` crosses the boundary once per chunk (not per record), so the hot
         // loop stays inlinable and ARC-free per id.
-        let chunks = max(2, ProcessInfo.processInfo.activeProcessorCount)
+        let chunks = hasUnicodeTerm ? min(2, ProcessInfo.processInfo.activeProcessorCount)
+                                    : max(2, ProcessInfo.processInfo.activeProcessorCount)
         let span = (n + chunks - 1) / chunks
         var parts = [[UInt32]](repeating: [], count: chunks)
         parts.withUnsafeMutableBufferPointer { buf in
@@ -76,10 +139,11 @@ public struct QueryEngine: Sendable {
                 let hi = min(n, lo + span)
                 guard lo < hi else { return }
                 buf[c] = self.scanRange(UInt32(lo), UInt32(hi), matchers: matchers,
-                                        matchPath: matchPath, hasNonASCII: hasNonASCII, ci: ci, in: store)
+                                        matchPath: matchPath, hasNonASCII: hasNonASCII, ci: ci,
+                                        isCancelled: isCancelled, in: store)
             }
         }
-        return parts.flatMap { $0 }
+        return isCancelled() ? nil : parts.flatMap { $0 }
     }
 
     // Scan ids in [lo, hi) and return those matching every term. The match logic is
@@ -87,7 +151,8 @@ public struct QueryEngine: Sendable {
     // common all-ASCII name scan allocates nothing and the optimizer can inline the
     // byte matcher. Called once per chunk — `store` is borrowed for the whole range.
     private func scanRange(_ lo: UInt32, _ hi: UInt32, matchers: [TermMatcher],
-                           matchPath: Bool, hasNonASCII: Bool, ci: Bool, in store: FileStore) -> [UInt32] {
+                           matchPath: Bool, hasNonASCII: Bool, ci: Bool,
+                           isCancelled: @escaping @Sendable () -> Bool, in store: FileStore) -> [UInt32] {
         var out: [UInt32] = []
         out.reserveCapacity(Int(hi - lo) / 64 + 16)
 
@@ -98,6 +163,7 @@ public struct QueryEngine: Sendable {
         if matchPath {
             var id = lo
             while id < hi {
+                if id & 1023 == 0 && isCancelled() { break }
                 if checkLive && !store.isLive(id) { id &+= 1; continue }
                 let pathStr = store.path(of: id)
                 var all = true
@@ -107,6 +173,9 @@ public struct QueryEngine: Sendable {
                         if !Glob.matchesASCII(patternLowerBytes: pat, in: Array(pathStr.utf8)[...]) { all = false }
                     case .string(let term):
                         if !Glob.matches(pattern: term, in: pathStr, caseInsensitive: ci) { all = false }
+                    case .unicode(let term):
+                        if !pathStr.utf8.contains(where: { $0 >= 0x80 }) ||
+                            !Glob.matches(pattern: term, in: pathStr, caseInsensitive: ci) { all = false }
                     }
                     if !all { break }
                 }
@@ -116,6 +185,7 @@ public struct QueryEngine: Sendable {
         } else if hasNonASCII {
             var id = lo
             while id < hi {
+                if id & 1023 == 0 && isCancelled() { break }
                 if checkLive && !store.isLive(id) { id &+= 1; continue }
                 let nameSlice = store.nameBytesSlice(of: id)
                 var all = true
@@ -125,6 +195,10 @@ public struct QueryEngine: Sendable {
                     case .ascii(let pat):
                         if !Glob.matchesASCII(patternLowerBytes: pat, in: nameSlice) { all = false }
                     case .string(let term):
+                        if nameStr == nil { nameStr = store.name(of: id) }
+                        if !Glob.matches(pattern: term, in: nameStr!, caseInsensitive: ci) { all = false }
+                    case .unicode(let term):
+                        if !nameSlice.contains(where: { $0 >= 0x80 }) { all = false; break }
                         if nameStr == nil { nameStr = store.name(of: id) }
                         if !Glob.matches(pattern: term, in: nameStr!, caseInsensitive: ci) { all = false }
                     }
@@ -137,6 +211,7 @@ public struct QueryEngine: Sendable {
             // Common case: all terms ASCII — zero String allocation per record.
             var id = lo
             while id < hi {
+                if id & 1023 == 0 && isCancelled() { break }
                 if checkLive && !store.isLive(id) { id &+= 1; continue }
                 let nameSlice = store.nameBytesSlice(of: id)
                 var all = true
@@ -148,6 +223,35 @@ public struct QueryEngine: Sendable {
                 if all { out.append(id) }
                 id &+= 1
             }
+        }
+        return out
+    }
+
+    private func scanIDs(_ ids: ArraySlice<UInt32>, masks: ArraySlice<UInt64>, requiredMask: UInt64,
+                         matchers: [TermMatcher],
+                         ci: Bool, isCancelled: @escaping @Sendable () -> Bool,
+                         in store: FileStore) -> [UInt32] {
+        var out: [UInt32] = []
+        out.reserveCapacity(ids.count / 16 + 16)
+        for index in ids.indices {
+            if index & 1023 == 0 && isCancelled() { break }
+            if masks[index] & requiredMask != requiredMask { continue }
+            let id = ids[index]
+            if !store.isLive(id) { continue }
+            let nameSlice = store.nameBytesSlice(of: id)
+            var nameStr: String? = nil
+            var all = true
+            for m in matchers {
+                switch m {
+                case .ascii(let pat):
+                    if !Glob.matchesASCII(patternLowerBytes: pat, in: nameSlice) { all = false }
+                case .string(let term), .unicode(let term):
+                    if nameStr == nil { nameStr = store.name(of: id) }
+                    if !Glob.matches(pattern: term, in: nameStr!, caseInsensitive: ci) { all = false }
+                }
+                if !all { break }
+            }
+            if all { out.append(id) }
         }
         return out
     }
@@ -182,10 +286,21 @@ public extension QueryEngine {
     /// since the UI only ever shows `limit` rows, the rest never needs ordering.
     func sortedPrefix(_ ids: [UInt32], by key: SortKey, ascending: Bool,
                       limit: Int, in store: FileStore) -> [UInt32] {
+        sortedPrefix(ids, by: key, ascending: ascending, limit: limit,
+                     isCancelled: { false }, in: store) ?? []
+    }
+
+    func sortedPrefix(_ ids: [UInt32], by key: SortKey, ascending: Bool,
+                      limit: Int, isCancelled: @escaping @Sendable () -> Bool,
+                      in store: FileStore) -> [UInt32]? {
+        if isCancelled() { return nil }
         let asc = ascendingLess(key, in: store)
         let earlier: (UInt32, UInt32) -> Bool = ascending ? asc : { asc($1, $0) }
 
-        if ids.count <= limit { return ids.sorted(by: earlier) }
+        if ids.count <= limit {
+            let sorted = ids.sorted(by: earlier)
+            return isCancelled() ? nil : sorted
+        }
 
         // Max-heap keyed by "worse rank" — the element most likely to be evicted
         // sits at the root. `worse(x, y)` is true when x ranks AFTER y.
@@ -213,13 +328,16 @@ public extension QueryEngine {
             }
         }
 
-        for id in ids {
+        for (index, id) in ids.enumerated() {
+            if index & 1023 == 0 && isCancelled() { return nil }
             if heap.count < limit {
                 heap.append(id); siftUp(heap.count - 1)
             } else if earlier(id, heap[0]) {   // better than the worst kept → replace it
                 heap[0] = id; siftDown(0)
             }
         }
-        return heap.sorted(by: earlier)
+        if isCancelled() { return nil }
+        let sorted = heap.sorted(by: earlier)
+        return isCancelled() ? nil : sorted
     }
 }

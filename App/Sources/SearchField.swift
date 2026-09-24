@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct SearchField: View {
+    @AppStorage(Styling.fontSizeKey) private var fontSize = Styling.defaultFontSize
     @Binding var text: String
     @Binding var matchPath: Bool
     var focused: FocusState<Bool>.Binding
@@ -9,12 +10,13 @@ struct SearchField: View {
         HStack {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
             TextField("Search everything…", text: $text)
-                .textFieldStyle(.plain).font(.system(size: 15))
+                .textFieldStyle(.plain).font(.system(size: fontSize + 2))
                 .focused(focused)
                 .onChange(of: text) { onChange() }
             Toggle("Match path", isOn: $matchPath).toggleStyle(.switch)
                 .onChange(of: matchPath) { onChange() }
         }
+        .font(.system(size: fontSize))
         .padding(8)
     }
 }

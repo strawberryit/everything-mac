@@ -15,6 +15,10 @@ public struct FileStore: Sendable {
     private var flags: [UInt8] = []     // bit0 = isDir
     private var volIDs: [UInt32] = []
     private var live: [Bool] = []
+    // Derived list for non-ASCII name searches; not part of the cache format.
+    public private(set) var nonASCIINameIDs: [UInt32] = []
+    // Parallel Bloom masks for Unicode scalars in those names.
+    public private(set) var nonASCIIUnicodeMasks: [UInt64] = []
 
     // parent id → its child ids. Without this, child/path lookups are O(n) scans
     // that rebuild every record's path string — FSEvents reconcile then pegs a
@@ -52,6 +56,10 @@ public struct FileStore: Sendable {
         flags.append(isDir ? 1 : 0)
         volIDs.append(volID)
         live.append(true)
+        if bytes.contains(where: { $0 >= 0x80 }) {
+            nonASCIINameIDs.append(id)
+            nonASCIIUnicodeMasks.append(Self.unicodeMask(name))
+        }
         if parent == Self.noParent { rootID = id }
         else { childrenByParent[parent, default: []].append(id) }
         return id
@@ -256,12 +264,31 @@ public struct FileStore: Sendable {
         childrenByParent.reserveCapacity(parents.count / 4)
         rootID = Self.noParent
         deletedCount = 0
+        nonASCIINameIDs.removeAll(keepingCapacity: false)
+        nonASCIIUnicodeMasks.removeAll(keepingCapacity: false)
         for i in 0..<parents.count {
             let p = parents[i]
             if p == Self.noParent { rootID = UInt32(i) }
             else { childrenByParent[p, default: []].append(UInt32(i)) }
             if !live[i] { deletedCount += 1 }
+            let start = Int(nameOffset[i])
+            let end = start + Int(nameLen[i])
+            if nameBytes[start..<end].contains(where: { $0 >= 0x80 }) {
+                nonASCIINameIDs.append(UInt32(i))
+                nonASCIIUnicodeMasks.append(Self.unicodeMask(name(of: UInt32(i))))
+            }
         }
+    }
+
+    static func unicodeMask(_ text: String) -> UInt64 {
+        var mask: UInt64 = 0
+        for scalar in text.lowercased().precomposedStringWithCanonicalMapping.unicodeScalars {
+            let value = scalar.value
+            guard value >= 0x80 else { continue }
+            mask |= 1 << (value & 63)
+            mask |= 1 << ((value &* 0x9E37_79B1) >> 26 & 63)
+        }
+        return mask
     }
 }
 

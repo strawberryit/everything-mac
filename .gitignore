@@ -17,6 +17,9 @@ Tests/*
 !Tests/IndexCoreTests/
 Tests/IndexCoreTests/*
 !Tests/IndexCoreTests/LiveMonitorLifetimeTests.swift
+!Tests/IndexCoreTests/FileRenameTests.swift
+!Tests/IndexCoreTests/KoreanSearchTests.swift
+!Tests/IndexCoreTests/SearchCancellationTests.swift
 
 # macOS, logs, crash dumps
 .DS_Store

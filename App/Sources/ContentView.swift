@@ -24,7 +24,15 @@ struct ContentView: View {
             ResultsTable(rows: model.results,
                          onSort: { k, a in model.setSort(k, ascending: a) },
                          onSelect: { model.selectedID = $0?.id },
-                         onActivate: { ResultActions.open($0) })
+                         onActivate: { ResultActions.open($0) },
+                         onRenamed: { record in
+                             Task {
+                                 let directory = URL(fileURLWithPath: record.path).deletingLastPathComponent().path
+                                 await model.index.enqueueChanges([
+                                     LiveMonitor.FSChange(path: directory, mustScanSubtree: false)
+                                 ])
+                             }
+                         })
             Divider()
             StatusBar(total: model.total, shown: model.results.count, scanning: model.scanning)
         }

@@ -105,11 +105,17 @@ final class AppModel: ObservableObject {
 
     // A live search option (case / whole-word / result limit) changed: persist it and
     // re-run immediately (no debounce — these come from a deliberate click, not typing).
-    func searchOptionsChanged() { savePrefs(); Task { await runSearch() } }
+    func searchOptionsChanged() {
+        savePrefs()
+        task?.cancel()
+        task = Task { await runSearch() }
+    }
 
     // Persisted sort change from a column header or the View menu.
     func setSort(_ key: QueryEngine.SortKey, ascending asc: Bool) {
-        sortKey = key; ascending = asc; savePrefs(); Task { await runSearch() }
+        sortKey = key; ascending = asc; savePrefs()
+        task?.cancel()
+        task = Task { await runSearch() }
     }
 
     func runSearch() async {

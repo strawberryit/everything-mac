@@ -4,8 +4,8 @@ import Foundation
 // contains a wildcard is anchored full-string glob matching.
 public enum Glob {
     public static func matches(pattern: String, in text: String, caseInsensitive: Bool) -> Bool {
-        let p = caseInsensitive ? pattern.lowercased() : pattern
-        let t = caseInsensitive ? text.lowercased() : text
+        let p = (caseInsensitive ? pattern.lowercased() : pattern).precomposedStringWithCanonicalMapping
+        let t = (caseInsensitive ? text.lowercased() : text).precomposedStringWithCanonicalMapping
         let pa = Array(p.unicodeScalars)
         let ta = Array(t.unicodeScalars)
         if !pa.contains("*") && !pa.contains("?") {
@@ -19,10 +19,10 @@ public enum Glob {
     /// the "Match whole word" search option; only meaningful for plain (non-wildcard)
     /// terms. Empty needle matches everything (an empty term constrains nothing).
     static func containsWholeWord(_ needle: String, in text: String, caseInsensitive: Bool) -> Bool {
-        let n = caseInsensitive ? needle.lowercased() : needle
+        let n = (caseInsensitive ? needle.lowercased() : needle).precomposedStringWithCanonicalMapping
         let na = Array(n.unicodeScalars)
         if na.isEmpty { return true }
-        let t = caseInsensitive ? text.lowercased() : text
+        let t = (caseInsensitive ? text.lowercased() : text).precomposedStringWithCanonicalMapping
         let ta = Array(t.unicodeScalars)
         if na.count > ta.count { return false }
         let words = CharacterSet.alphanumerics

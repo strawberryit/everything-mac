@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct StatusBar: View {
+    @AppStorage(Styling.fontSizeKey) private var fontSize = Styling.defaultFontSize
     var total: Int
     var shown: Int
     var scanning: Bool
@@ -18,7 +19,7 @@ struct StatusBar: View {
             Spacer()
             Text("\(shown.formatted()) results")
         }
-        .font(.system(size: 11)).foregroundStyle(.secondary)
+        .font(.system(size: fontSize - 2)).foregroundStyle(.secondary)
         .padding(.horizontal, 10).padding(.vertical, 4)
     }
 }

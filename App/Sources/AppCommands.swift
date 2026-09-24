@@ -8,6 +8,7 @@ import IndexCore
 // is selected so the menu reflects what's actually actionable.
 struct AppCommands: Commands {
     @ObservedObject var model: AppModel
+    @AppStorage(Styling.fontSizeKey) private var fontSize = Styling.defaultFontSize
 
     private var sortBinding: Binding<QueryEngine.SortKey> {
         Binding(get: { model.sortKey },
@@ -86,6 +87,24 @@ struct AppCommands: Commands {
                 .keyboardShortcut("p", modifiers: [.command, .shift])
             Toggle("Match Case", isOn: caseSensitiveBinding)
             Toggle("Match Whole Word", isOn: wholeWordBinding)
+            Divider()
+            Button("Zoom In") {
+                fontSize = min(Styling.fontSizeRange.upperBound, fontSize + 1)
+            }
+            .keyboardShortcut("+", modifiers: .command)
+            .disabled(fontSize >= Styling.fontSizeRange.upperBound)
+
+            Button("Zoom Out") {
+                fontSize = max(Styling.fontSizeRange.lowerBound, fontSize - 1)
+            }
+            .keyboardShortcut("-", modifiers: .command)
+            .disabled(fontSize <= Styling.fontSizeRange.lowerBound)
+
+            Button("Actual Size") {
+                fontSize = Styling.defaultFontSize
+            }
+            .keyboardShortcut("0", modifiers: .command)
+            .disabled(fontSize == Styling.defaultFontSize)
         }
 
         // HELP — point at the project instead of the empty default Help menu.

@@ -2,6 +2,23 @@ import Foundation
 import CoreServices
 import IndexCore
 
+private final class SearchCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 // Serializes all store access. Mutations (scan, reconcile) and reads (search)
 // never race because they run on this actor. The full-disk scan is COOPERATIVE:
 // it yields every few thousand files so queued reads (search, totalCount) and
@@ -47,23 +64,43 @@ actor IndexActor {
     }
 
     func search(_ text: String, matchPath: Bool, caseInsensitive: Bool = true, wholeWord: Bool = false,
-                sort: QueryEngine.SortKey, ascending: Bool, limit: Int = 5000) -> [FileRecord] {
-        // Re-scan only when the query (not the sort) changed. The key folds in every
-        // flag that changes which ids match — matchPath, case sensitivity, whole-word —
-        // so flipping any of them invalidates the cache. engine.search already excludes
-        // tombstoned ids, so no separate isLive filter pass is needed.
-        let key = (matchPath ? "P" : "N") + (caseInsensitive ? "i" : "s") + (wholeWord ? "w" : "x") + "\u{1}" + text
-        if key != cachedQueryKey {
-            cachedIDs = engine.search(Query(text: text, matchPath: matchPath,
-                                            caseInsensitive: caseInsensitive, wholeWord: wholeWord), in: store)
-            cachedQueryKey = key
-        }
-        let sorted = engine.sortedPrefix(cachedIDs, by: sort, ascending: ascending, limit: max(1, limit), in: store)
-        return sorted.map { id in
-            FileRecord(id: id, name: store.name(of: id), path: store.path(of: id),
-                       parent: store.parent(of: id),
-                       size: store.size(of: id), mtime: store.mtime(of: id),
-                       isDir: store.isDir(of: id), volID: store.volID(of: id))
+                sort: QueryEngine.SortKey, ascending: Bool, limit: Int = 5000) async -> [FileRecord] {
+        let cancellation = SearchCancellation()
+        let isCancelled: @Sendable () -> Bool = { cancellation.isCancelled }
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { cancellation.cancel() }
+            if isCancelled() { return [] }
+            // Re-scan only when the query (not the sort) changed. Commit the cache
+            // only after every phase completes, so cancellation cannot cache partial ids.
+            let key = (matchPath ? "P" : "N") + (caseInsensitive ? "i" : "s")
+                + (wholeWord ? "w" : "x") + "\u{1}" + text
+            let cacheHit = key == cachedQueryKey
+            let ids: [UInt32]
+            if cacheHit {
+                ids = cachedIDs
+            } else {
+                guard let found = engine.search(Query(text: text, matchPath: matchPath,
+                                                      caseInsensitive: caseInsensitive, wholeWord: wholeWord),
+                                                in: store, isCancelled: isCancelled) else { return [] }
+                ids = found
+            }
+            guard let sorted = engine.sortedPrefix(ids, by: sort, ascending: ascending,
+                                                   limit: max(1, limit), isCancelled: isCancelled,
+                                                   in: store) else { return [] }
+            var records: [FileRecord] = []
+            records.reserveCapacity(sorted.count)
+            for (index, id) in sorted.enumerated() {
+                if index & 1023 == 0 && isCancelled() { return [] }
+                records.append(FileRecord(id: id, name: store.name(of: id), path: store.path(of: id),
+                                          parent: store.parent(of: id), size: store.size(of: id),
+                                          mtime: store.mtime(of: id), isDir: store.isDir(of: id),
+                                          volID: store.volID(of: id)))
+            }
+            if isCancelled() { return [] }
+            if !cacheHit { cachedIDs = ids; cachedQueryKey = key }
+            return records
+        } onCancel: {
+            cancellation.cancel()
         }
     }
 
